@@ -12,6 +12,10 @@ const {
   createAudioPlayer,
   createAudioResource,
   AudioPlayerStatus,
+  VoiceConnectionStatus,
+  VoiceConnectionDisconnectReason,
+  NoSubscriberBehavior,
+  entersState,
   StreamType,
 } = require("@discordjs/voice");
 const { REST } = require("@discordjs/rest");
@@ -76,7 +80,7 @@ client.once("ready", async () => {
         option
           .setName("station")
           .setDescription("Όνομα σταθμού π.χ. sfera")
-          .setRequired(true)
+          .setRequired(true),
       ),
     new SlashCommandBuilder()
       .setName("stop-radio")
@@ -108,7 +112,7 @@ client.on("interactionCreate", async (interaction) => {
   if (interaction.commandName === "play-radio") {
     const input = interaction.options.getString("station").toLowerCase();
     const matchedStation = Object.entries(stations).find(([name]) =>
-      name.toLowerCase().includes(input)
+      name.toLowerCase().includes(input),
     );
 
     if (!matchedStation) {
@@ -150,17 +154,60 @@ client.on("interactionCreate", async (interaction) => {
       channelId: channel.id,
       guildId: guildId,
       adapterCreator: channel.guild.voiceAdapterCreator,
+      debug: true,
+      selfDeaf: false,
+      selfMute: false,
+    });
+
+    connection.on("stateChange", (oldState, newState) => {
+      console.log(
+        `[Voice:${guildId}] ${oldState.status} -> ${newState.status}`,
+      );
+
+      if (newState.status === VoiceConnectionStatus.Disconnected) {
+        const reasonName = Object.entries(VoiceConnectionDisconnectReason).find(
+          ([, value]) => value === newState.reason,
+        )?.[0];
+
+        console.log(
+          `[Voice:${guildId}] Disconnected reason: ${reasonName ?? newState.reason}`,
+        );
+
+        if (typeof newState.closeCode !== "undefined") {
+          console.log(
+            `[Voice:${guildId}] WebSocket close code: ${newState.closeCode}`,
+          );
+        }
+      }
+    });
+
+    connection.on("error", (error) => {
+      console.error(`[Voice:${guildId}] Connection error:`, error);
+    });
+
+    connection.on("debug", (message) => {
+      console.log(`[Voice:${guildId}] ${message}`);
     });
 
     const ffmpegArgs = [
+      "-reconnect",
+      "1",
+      "-reconnect_streamed",
+      "1",
+      "-reconnect_delay_max",
+      "5",
       "-i",
       stationUrl,
       "-analyzeduration",
       "0",
       "-loglevel",
       "warning",
+      "-vn",
+      "-nostdin",
+      "-acodec",
+      "libopus",
       "-f",
-      "s16le",
+      "ogg",
       "-ar",
       "48000",
       "-ac",
@@ -193,7 +240,7 @@ client.on("interactionCreate", async (interaction) => {
 
     ffmpegProcess.on("close", (code, signal) => {
       console.log(
-        `ffmpeg process closed with code ${code} and signal ${signal}`
+        `ffmpeg process closed with code ${code} and signal ${signal}`,
       );
       const current = connections.get(guildId);
       if (
@@ -203,7 +250,7 @@ client.on("interactionCreate", async (interaction) => {
         current.player.state.status !== AudioPlayerStatus.Idle
       ) {
         console.log(
-          "FFmpeg closed unexpectedly while player was not idle. Cleaning up."
+          "FFmpeg closed unexpectedly while player was not idle. Cleaning up.",
         );
         current.player.stop();
         current.connection.destroy();
@@ -213,15 +260,30 @@ client.on("interactionCreate", async (interaction) => {
 
     ffmpegProcess.on("exit", (code, signal) => {
       console.log(
-        `ffmpeg process exited with code ${code} and signal ${signal}`
+        `ffmpeg process exited with code ${code} and signal ${signal}`,
       );
     });
 
     const resource = createAudioResource(ffmpegProcess.stdout, {
-      inputType: StreamType.Raw,
+      inputType: StreamType.OggOpus,
     });
 
-    const player = createAudioPlayer();
+    const player = createAudioPlayer({
+      behaviors: {
+        noSubscriber: NoSubscriberBehavior.Play,
+      },
+      debug: true,
+    });
+
+    player.on("stateChange", (oldState, newState) => {
+      console.log(
+        `[Player:${guildId}] ${oldState.status} -> ${newState.status}`,
+      );
+    });
+
+    player.on("debug", (message) => {
+      console.log(`[Player:${guildId}] ${message}`);
+    });
 
     player.on(AudioPlayerStatus.Playing, () => {
       interaction.editReply(`📻 Παίζει τώρα: **${stationName}**`);
@@ -252,9 +314,19 @@ client.on("interactionCreate", async (interaction) => {
       }
     });
 
-    player.play(resource);
+    try {
+      await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
+    } catch (error) {
+      console.error(`[Voice:${guildId}] Failed to become ready:`, error);
+      connection.destroy();
+      await interaction.editReply(
+        "⚠️ Δεν κατάφερα να συνδεθώ στο voice channel. Δοκίμασε ξανά.",
+      );
+      return;
+    }
 
     connection.subscribe(player);
+    player.play(resource);
 
     connections.set(guildId, {
       connection,
@@ -317,13 +389,13 @@ client.on("interactionCreate", async (interaction) => {
       const stationName = existing.currentStation;
       const stationUrl = stations[stationName];
       console.log(
-        `Identifying song from station: ${stationName}, URL: ${stationUrl}`
+        `Identifying song from station: ${stationName}, URL: ${stationUrl}`,
       );
 
       if (!stationUrl) {
         console.error("Station URL not found for:", stationName);
         await interaction.editReply(
-          "⚠️ Δεν ήταν δυνατή η αναγνώριση του σταθμού."
+          "⚠️ Δεν ήταν δυνατή η αναγνώριση του σταθμού.",
         );
         return;
       }
@@ -338,7 +410,7 @@ client.on("interactionCreate", async (interaction) => {
       console.log(`Sample will be saved to: ${samplePath}`);
 
       await interaction.editReply(
-        "🎵 Ακούω το τραγούδι... Παρακαλώ περιμένετε."
+        "🎵 Ακούω το τραγούδι... Παρακαλώ περιμένετε.",
       );
 
       console.log("Starting FFmpeg recording process");
@@ -365,7 +437,7 @@ client.on("interactionCreate", async (interaction) => {
         if (code !== 0) {
           console.error(`FFmpeg recording failed with code: ${code}`);
           await interaction.editReply(
-            "⚠️ Σφάλμα κατά την δημιουργία δείγματος ήχου."
+            "⚠️ Σφάλμα κατά την δημιουργία δείγματος ήχου.",
           );
           return;
         }
@@ -377,7 +449,7 @@ client.on("interactionCreate", async (interaction) => {
             if (stats.size === 0) {
               console.error("Sample file is empty");
               await interaction.editReply(
-                "⚠️ Το δείγμα ήχου είναι κενό. Προσπαθήστε ξανά."
+                "⚠️ Το δείγμα ήχου είναι κενό. Προσπαθήστε ξανά.",
               );
               fs.unlinkSync(samplePath);
               return;
@@ -385,7 +457,7 @@ client.on("interactionCreate", async (interaction) => {
           } else {
             console.error("Sample file was not created");
             await interaction.editReply(
-              "⚠️ Δεν δημιουργήθηκε αρχείο ήχου. Προσπαθήστε ξανά."
+              "⚠️ Δεν δημιουργήθηκε αρχείο ήχου. Προσπαθήστε ξανά.",
             );
             return;
           }
@@ -407,7 +479,7 @@ client.on("interactionCreate", async (interaction) => {
 
           console.log(
             "Response received from AudD API:",
-            JSON.stringify(response.data).substring(0, 200) + "..."
+            JSON.stringify(response.data).substring(0, 200) + "...",
           );
 
           fs.unlinkSync(samplePath);
@@ -432,7 +504,7 @@ client.on("interactionCreate", async (interaction) => {
                   value: result.release_date || "Άγνωστο",
                   inline: true,
                 },
-                { name: "Σταθμός", value: stationName, inline: true }
+                { name: "Σταθμός", value: stationName, inline: true },
               );
 
             if (result.song_link) {
@@ -447,7 +519,7 @@ client.on("interactionCreate", async (interaction) => {
               embed.setThumbnail(
                 result.apple_music.artwork.url
                   .replace("{w}", "500")
-                  .replace("{h}", "500")
+                  .replace("{h}", "500"),
               );
             }
 
@@ -458,7 +530,7 @@ client.on("interactionCreate", async (interaction) => {
           } else {
             console.log("No song identified in the response:", response.data);
             await interaction.editReply(
-              "❓ Συγγνώμη, δεν μπόρεσα να αναγνωρίσω το τραγούδι. Προσπαθήστε ξανά αργότερα."
+              "❓ Συγγνώμη, δεν μπόρεσα να αναγνωρίσω το τραγούδι. Προσπαθήστε ξανά αργότερα.",
             );
           }
         } catch (error) {
@@ -467,7 +539,7 @@ client.on("interactionCreate", async (interaction) => {
             console.error("API error response:", error.response.data);
           }
           await interaction.editReply(
-            "⚠️ Σφάλμα κατά την αναγνώριση τραγουδιού: " + error.message
+            "⚠️ Σφάλμα κατά την αναγνώριση τραγουδιού: " + error.message,
           );
 
           if (fs.existsSync(samplePath)) {
@@ -480,13 +552,13 @@ client.on("interactionCreate", async (interaction) => {
       recordProcess.on("error", async (err) => {
         console.error("Error spawning FFmpeg process:", err);
         await interaction.editReply(
-          "⚠️ Σφάλμα κατά την εγγραφή δείγματος ήχου: " + err.message
+          "⚠️ Σφάλμα κατά την εγγραφή δείγματος ήχου: " + err.message,
         );
       });
     } catch (error) {
       console.error("Error in identify-song command:", error);
       await interaction.editReply(
-        "⚠️ Σφάλμα κατά την αναγνώριση τραγουδιού: " + error.message
+        "⚠️ Σφάλμα κατά την αναγνώριση τραγουδιού: " + error.message,
       );
     }
   }
@@ -496,7 +568,7 @@ client.on("ready", async () => {
   const appCommands = await client.application.commands.fetch();
   console.log(
     "📜 Commands:",
-    [...appCommands.values()].map((cmd) => cmd.name)
+    [...appCommands.values()].map((cmd) => cmd.name),
   );
 });
 
@@ -514,12 +586,12 @@ client.on("voiceStateUpdate", (oldState, newState) => {
 
     // Check if there are any non-bot members left in the channel
     const nonBotMembers = voiceChannel.members.filter(
-      (member) => !member.user.bot
+      (member) => !member.user.bot,
     );
 
     if (nonBotMembers.size === 0) {
       console.log(
-        `👋 Disconnecting from ${voiceChannel.name} as no humans remain.`
+        `👋 Disconnecting from ${voiceChannel.name} as no humans remain.`,
       );
       connectionEntry.player.stop();
       connectionEntry.connection.destroy();
